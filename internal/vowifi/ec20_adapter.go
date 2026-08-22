@@ -421,9 +421,6 @@ func (adapter *EC20Adapter) CheckReady(
 		return AKAEvidence{}, err
 	}
 
-	// CCHO/CGLA/GET RESPONSE/CCHC is one UICC transaction. Serialize it
-	// across the adapter so periodic device refreshes or another AKA exchange
-	// cannot insert an APDU between a 61xx response and GET RESPONSE.
 	adapter.apduMu.Lock()
 	defer adapter.apduMu.Unlock()
 	if locker, ok := adapter.executor.(EC20UICCLocker); ok {
@@ -431,41 +428,27 @@ func (adapter *EC20Adapter) CheckReady(
 		defer locker.UnlockUICC()
 	}
 
-	aid, application, err := adapter.discoverAKAApplication(ctx, binding.deviceID)
-	if err != nil {
-		return AKAEvidence{}, err
-	}
-	channel, err := adapter.openLogicalChannel(ctx, binding.deviceID, aid)
-	basicChannel := false
-	if err == nil {
-		if err := adapter.closeLogicalChannelWithCleanup(
-			binding.deviceID,
-			channel,
-		); err != nil {
-			return AKAEvidence{}, err
-		}
-	} else {
-		// Several EC20 firmware branches reject CCHO/CGLA even though their
-		// basic-channel CSIM implementation is standards compliant.
-		if err := adapter.selectBasicApplication(
-			ctx,
-			binding.deviceID,
-			aid,
-		); err != nil {
-			return AKAEvidence{}, errors.Join(
-				ErrEC20ApplicationAbsent,
-				err,
-			)
-		}
-		basicChannel = true
+	// -----------------------------------------------------------------
+	// 【关键修复】：跳过 CUAD 探测和 CCHO 逻辑通道！
+	// 展锐 EC200T-CN 遇到 AT+CCHO 会直接 Crash 进 WUKONG 模式！
+	// -----------------------------------------------------------------
+	aid := usimAIDPrefix
+	application := "USIM"
+
+	// 尝试直接在 Basic Channel 选择 USIM 应用
+	if err := adapter.selectBasicApplication(ctx, binding.deviceID, aid); err != nil {
+		return AKAEvidence{}, errors.Join(ErrEC20ApplicationAbsent, err)
 	}
 
+	// 强制标记为 basicChannel，以后所有 APDU 都走 AT+CSIM
 	binding.aid = aid
 	binding.application = application
-	binding.basicChannel = basicChannel
+	binding.basicChannel = true
+
 	adapter.mu.Lock()
 	adapter.bindings[binding.iccid] = binding
 	adapter.mu.Unlock()
+
 	return AKAEvidence{Ready: true, Application: application}, nil
 }
 
@@ -496,40 +479,12 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 	if err != nil {
 		return AKAResult{}, err
 	}
-	if strings.EqualFold(strings.TrimSpace(preference), "isim_strict") && binding.application != "ISIM" {
-		aid, application, err := adapter.discoverPreferredAKAApplication(
-			ctx,
-			binding.deviceID,
-			isimAIDPrefix,
-			"ISIM",
-		)
-		if err != nil {
-			return AKAResult{}, err
-		}
-		binding.aid = aid
-		binding.application = application
-		binding.basicChannel = false
-		adapter.mu.Lock()
-		adapter.bindings[binding.iccid] = binding
-		adapter.mu.Unlock()
-	}
-	if binding.aid == "" {
-		if _, err := adapter.CheckReady(ctx, identity); err != nil {
-			return AKAResult{}, err
-		}
-		binding, err = adapter.bindingFor(identity)
-		if err != nil {
-			return AKAResult{}, err
-		}
-	}
-	if strings.EqualFold(strings.TrimSpace(preference), "isim_strict") && binding.application != "ISIM" {
-		return AKAResult{}, fmt.Errorf(
-			"%w: ISIM strict requested, selected %s (%s)",
-			ErrEC20ApplicationAbsent,
-			binding.application,
-			binding.aid,
-		)
-	}
+
+	// -----------------------------------------------------------------
+	// 【关键修复】：防呆逻辑，强制 EC200T 走 Basic Channel (AT+CSIM)
+	// -----------------------------------------------------------------
+	binding.basicChannel = true
+
 	if err := adapter.verifyLiveICCID(ctx, binding); err != nil {
 		return AKAResult{}, err
 	}
@@ -543,54 +498,27 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 
 	apdu := buildUSIMAuthenticateAPDU(challenge)
 	var raw []byte
-	if binding.basicChannel {
-		if err := adapter.selectBasicApplication(
-			ctx,
-			binding.deviceID,
-			binding.aid,
-		); err != nil {
-			return AKAResult{}, err
-		}
-		raw, err = adapter.transmitBasicAPDU(
-			ctx,
-			binding.deviceID,
-			apdu,
-			true,
-		)
-		if err != nil {
-			return AKAResult{}, ErrEC20AKACommand
-		}
-	} else {
-		channel, err := adapter.openLogicalChannel(
-			ctx,
-			binding.deviceID,
-			binding.aid,
-		)
-		if err != nil {
-			return AKAResult{}, err
-		}
-		var commandErr error
-		raw, commandErr = adapter.transmitLogicalAPDU(
-			ctx,
-			binding.deviceID,
-			channel,
-			apdu,
-			true,
-		)
-		closeErr := adapter.closeLogicalChannelWithCleanup(
-			binding.deviceID,
-			channel,
-		)
-		if commandErr != nil {
-			if closeErr != nil {
-				return AKAResult{}, errors.Join(commandErr, closeErr)
-			}
-			return AKAResult{}, commandErr
-		}
-		if closeErr != nil {
-			return AKAResult{}, closeErr
-		}
+
+	// 1. 先用 SELECT 选中文件
+	if err := adapter.selectBasicApplication(
+		ctx,
+		binding.deviceID,
+		binding.aid,
+	); err != nil {
+		return AKAResult{}, err
 	}
+
+	// 2. 通过 AT+CSIM 透传认证 APDU
+	raw, err = adapter.transmitBasicAPDU(
+		ctx,
+		binding.deviceID,
+		apdu,
+		true,
+	)
+	if err != nil {
+		return AKAResult{}, ErrEC20AKACommand
+	}
+
 	return parseUSIMAuthenticateResponse(raw)
 }
 
@@ -792,6 +720,10 @@ func (adapter *EC20Adapter) EnterVoWiFiRFOff(
 		if _, err := adapter.execute(ctx, deviceID, "AT+CFUN=4"); err != nil {
 			return fmt.Errorf("enter EC20 RF-off mode: %w", err)
 		}
+		// -------------------------------------------------------------
+		// 【修复项 3】：给硬件电源与基带 300ms 稳压和状态切换时间
+		// -------------------------------------------------------------
+		time.Sleep(300 * time.Millisecond)
 	}
 	mode, err = adapter.readOperatingMode(ctx, deviceID)
 	if err != nil {
@@ -1223,11 +1155,19 @@ func (adapter *EC20Adapter) transmitBasicAPDU(
 	var collected []byte
 	current := append([]byte(nil), apdu...)
 	for exchange := 0; exchange < 4; exchange++ {
+		// 每次发送前停顿 20ms，防止缓冲溢出
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+
 		command := fmt.Sprintf(
 			`AT+CSIM=%d,"%s"`,
 			len(current)*2,
 			strings.ToUpper(hex.EncodeToString(current)),
 		)
+		
 		var response modem.Response
 		var err error
 		if sensitive {
@@ -1261,7 +1201,6 @@ func (adapter *EC20Adapter) transmitBasicAPDU(
 			collected = append(collected, byte(status>>8), byte(status))
 			return collected, nil
 		}
-		// GET RESPONSE on the same basic channel. Le=0 means 256 bytes.
 		current = []byte{0x00, 0xc0, 0x00, 0x00, byte(status)}
 	}
 	return nil, errors.New("vocat: EC20 APDU response chaining exceeded limit")
