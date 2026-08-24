@@ -57,6 +57,7 @@ USER root
 VOLUME ["/opt/vocat/data"]
 EXPOSE 7575
 ENV VOCAT_ADDR=0.0.0.0:7575 \
-    VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db
+    VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db \
+    VOCAT_DEVELOPER=false
 
 ENTRYPOINT ["/usr/local/bin/vocat-entrypoint"]
