@@ -1,12 +1,6 @@
 name: automatic release threshold
 
 on:
-  push:
-    branches:
-      - master
-  # Recheck once a day in case a branch-push run was skipped or interrupted.
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
