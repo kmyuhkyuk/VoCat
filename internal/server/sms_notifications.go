@@ -323,24 +323,34 @@ func renderSMSWebhookTemplate(template string, message smsNotification) string {
 	return template
 }
 
+func buildPushplusPayload(token, title, content, topic, channel string) map[string]any {
+	payload := map[string]any{
+		"token":    token,
+		"title":    title,
+		"content":  content,
+		"template": "txt",
+	}
+	if topic != "" {
+		payload["topic"] = topic
+	}
+	if channel != "" {
+		payload["channel"] = channel
+	}
+	return payload
+}
+
 func sendPushplusSMSNotification(ctx context.Context, config map[string]any, message smsNotification) error {
 	destination, err := validateOutboundURL(ctx, "https://www.pushplus.plus/send", true)
 	if err != nil {
 		return err
 	}
-	payload := map[string]any{
-		"token":     configString(config, "token"),
-		"title":     "收到新短信",
-		"content":   message.DetailText(),
-		"template":  "txt",
-		"timestamp": time.Now().UnixMilli(),
-	}
-	if topic := configString(config, "topic"); topic != "" {
-		payload["topic"] = topic
-	}
-	if channel := configString(config, "channel"); channel != "" {
-		payload["channel"] = channel
-	}
+	payload := buildPushplusPayload(
+		configString(config, "token"),
+		"收到新短信",
+		message.DetailText(),
+		configString(config, "topic"),
+		configString(config, "channel"),
+	)
 	encoded, _ := json.Marshal(payload)
 	client, err := restrictedHTTPClient(ctx, 8*time.Second, "")
 	if err != nil {
