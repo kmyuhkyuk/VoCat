@@ -1229,12 +1229,25 @@ type imsUSSIController interface {
 	SendUSSI(context.Context, string, vowifi.USSISubmitRequest) (vowifi.USSISubmitResult, error)
 }
 
+// imsUSSICanceler is the optional VoWiFi runtime capability used to abort an active USSI dialog.
+type imsUSSICanceler interface {
+	CancelUSSI(context.Context, string, string) error
+}
+
 // openUSSDSession mirrors device.Manager.openUSSDSession but lives on the HTTP
 // server so a USSI awaiting-input reply can hand back a token the existing
 // continue/cancel endpoints understand. The token is only a device handle;
 // the IMS session owns the actual dialog.
 func (s *Server) openUSSDSession(deviceID string) string {
 	return s.ussdSessions.open(deviceID)
+}
+
+func (s *Server) openUSSDSessionWithNetwork(deviceID, networkSessionID string) string {
+	return s.ussdSessions.openWithNetwork(deviceID, networkSessionID)
+}
+
+func (s *Server) ussdNetworkSession(sessionID string) string {
+	return s.ussdSessions.networkSession(sessionID)
 }
 
 // ussdSessionDevice resolves a USSD session token created by openUSSDSession
@@ -1336,14 +1349,10 @@ func ussdResultFromUSSI(result vowifi.USSISubmitResult, deviceID string, server 
 		Status:       result.Status,
 		Continueable: result.Continueable,
 	}
-	// USSI has no inline continue/terminate flag in the 2xx response body, so
-	// treat any non-empty successful reply as potentially multi-round. The cancel
-	// endpoint drops the local token; the network will time the dialog out if it
-	// was actually final.
-	if mapped.Status != "failed" && mapped.Status != "terminated" && mapped.Text != "" {
+	if result.Status == "awaiting_input" || (result.Continueable && result.Status != "failed" && result.Status != "terminated") {
 		mapped.Status = "awaiting_input"
 		mapped.Continueable = true
-		mapped.SessionID = server.openUSSDSession(deviceID)
+		mapped.SessionID = server.openUSSDSessionWithNetwork(deviceID, result.SessionID)
 	}
 	return mapped
 }

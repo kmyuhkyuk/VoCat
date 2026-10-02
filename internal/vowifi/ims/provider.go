@@ -641,6 +641,8 @@ type Session struct {
 	nextRPReference    byte
 	callMu             sync.Mutex
 	calls              map[string]*imsCall
+	ussiMu             sync.Mutex
+	ussiDialogs        map[string]*ussiDialog
 
 	mu                  sync.Mutex
 	closed              bool
@@ -714,6 +716,7 @@ func newSession(
 		transactions:       make(map[sipTransactionKey]chan *sipResponse),
 		inboundConnections: make(map[net.Conn]struct{}),
 		calls:              make(map[string]*imsCall),
+		ussiDialogs:        make(map[string]*ussiDialog),
 		evidence: vowifi.IMSEvidence{
 			RegistrationState: "registering",
 			Transport:         transport,
@@ -1753,6 +1756,11 @@ func (session *Session) Close(ctx context.Context) error {
 		}
 	}
 	session.callMu.Unlock()
+	session.ussiMu.Lock()
+	for id := range session.ussiDialogs {
+		delete(session.ussiDialogs, id)
+	}
+	session.ussiMu.Unlock()
 	var cleanupErrors []error
 	if unregisterErr != nil {
 		cleanupErrors = append(cleanupErrors, unregisterErr)

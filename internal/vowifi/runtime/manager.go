@@ -349,6 +349,24 @@ func (manager *Manager) SendUSSI(
 	return item.orchestrator.SendUSSI(ctx, request)
 }
 
+func (manager *Manager) CancelUSSI(
+	ctx context.Context,
+	deviceID string,
+	sessionID string,
+) error {
+	manager.mu.Lock()
+	if manager.closed {
+		manager.mu.Unlock()
+		return ErrClosed
+	}
+	item := manager.entries[deviceID]
+	manager.mu.Unlock()
+	if item == nil {
+		return nil
+	}
+	return item.orchestrator.CancelUSSI(ctx, sessionID)
+}
+
 func (manager *Manager) Calls(deviceID string) ([]vowifi.Call, error) {
 	if err := manager.Ensure(manager.ctx, deviceID); err != nil {
 		return nil, err
