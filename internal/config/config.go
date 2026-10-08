@@ -19,6 +19,7 @@ const maxConfigBytes = 1 << 20
 type Config struct {
 	Address             string
 	DatabasePath        string
+	Developer           bool
 	SessionTTL          time.Duration
 	SecureCookies       bool
 	ShutdownTimeout     time.Duration
@@ -45,6 +46,7 @@ func Default() Config {
 	return Config{
 		Address:             "0.0.0.0:7575",
 		DatabasePath:        "./data/vocat.db",
+		Developer:           false,
 		SessionTTL:          24 * time.Hour,
 		SecureCookies:       false,
 		ShutdownTimeout:     10 * time.Second,
@@ -175,6 +177,13 @@ func applyEnvironment(cfg *Config) error {
 		}
 		cfg.MaxRequestBodyBytes = size
 	}
+	if value, ok := os.LookupEnv("VOCAT_DEVELOPER"); ok {
+        dev, err := strconv.ParseBool(value)
+        if err != nil {
+            return fmt.Errorf("VOCAT_DEVELOPER: %w", err)
+        }
+        cfg.Developer = dev
+    }
 	return nil
 }
 

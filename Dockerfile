@@ -35,10 +35,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     ./cmd/vocat
 
 # ---- Stage 3: minimal runtime ----
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates ccid iproute2 pcsc-lite qmi-utils tzdata && \
-    addgroup -S -g 1000 vocat && \
-    adduser -S -D -H -u 1000 -G vocat vocat
+FROM kmyuhkyuk/vocat-base-alpine
 
 RUN mkdir -p /opt/vocat/bin /opt/vocat/data && \
     chown -R vocat:vocat /opt/vocat
@@ -57,6 +54,7 @@ USER root
 VOLUME ["/opt/vocat/data"]
 EXPOSE 7575
 ENV VOCAT_ADDR=0.0.0.0:7575 \
-    VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db
+    VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db \
+    VOCAT_DEVELOPER=false
 
 ENTRYPOINT ["/usr/local/bin/vocat-entrypoint"]

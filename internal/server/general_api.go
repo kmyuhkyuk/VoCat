@@ -359,6 +359,9 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) developerActive(ctx context.Context) bool {
+	if os.Getenv("VOCAT_DEVELOPER") == "true" {
+        return true
+    }
 	return s.developerEnabled && developer.Enabled(ctx, s.store)
 }
 
