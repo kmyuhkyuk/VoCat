@@ -990,7 +990,7 @@ func (adapter *EC20Adapter) discoverPreferredAKAApplication(
 	aidPrefix string,
 	application string,
 ) (string, string, error) {
-	// CUAD 不可用时会读 EF_DIR，多条基本通道命令必须持有同一事务锁。
+	// EF_DIR 发现使用多条基本通道命令，必须持有同一事务锁。
 	adapter.apduMu.Lock()
 	defer adapter.apduMu.Unlock()
 	if locker, ok := adapter.executor.(EC20UICCLocker); ok {
