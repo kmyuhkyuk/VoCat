@@ -35,18 +35,11 @@ const (
 	channelCleanupTimeout = 3 * time.Second
 )
 
-// EC20ATExecutor is deliberately the same narrow shape as
-// device.Manager.ExecuteAT. Production code passes the device manager directly;
-// tests can use an evidence transcript without opening any serial device.
+// EC20ATExecutor exposes only semantic AT and APDU operations. Production code
+// passes the device manager directly; tests can use an evidence transcript.
 type EC20ATExecutor interface {
 	ExecuteAT(context.Context, string, string) (modem.Response, error)
-}
-
-// EC20SensitiveATExecutor is implemented by device.Manager so an APDU carrying
-// RAND and AUTN is not retained as a device error. The fallback exists only for
-// small deterministic test executors.
-type EC20SensitiveATExecutor interface {
-	ExecuteSensitiveAT(context.Context, string, string) (modem.Response, error)
+	ExecuteAPDU(context.Context, string, modem.APDUCommand, int, []byte) ([]byte, error)
 }
 
 type EC20UICCLocker interface {
@@ -1026,7 +1019,7 @@ func (adapter *EC20Adapter) discoverBasicApplicationAID(
 			0x00, 0xa4, 0x00, 0x04, 0x02,
 			byte(fileID >> 8), byte(fileID), 0x00,
 		}
-		raw, err := adapter.transmitBasicAPDU(ctx, deviceID, apdu, false)
+		raw, err := adapter.transmitBasicAPDU(ctx, deviceID, apdu)
 		if err != nil {
 			return err
 		}
@@ -1050,7 +1043,6 @@ func (adapter *EC20Adapter) discoverBasicApplicationAID(
 			ctx,
 			deviceID,
 			[]byte{0x00, 0xb2, byte(record), 0x04, 0x00},
-			false,
 		)
 		if err != nil {
 			return "", fmt.Errorf("read EC20 EF_DIR record %d: %w", record, err)
@@ -1087,18 +1079,8 @@ func (adapter *EC20Adapter) openLogicalChannel(
 	if err != nil {
 		return 0, fmt.Errorf("%w: open application: %w", ErrEC20ApplicationAbsent, err)
 	}
-	value := valueAfterATPrefix(response, "+CCHO:")
-	if value == "" {
-		for _, line := range response.Lines {
-			line = strings.TrimSpace(line)
-			if _, parseErr := strconv.Atoi(line); parseErr == nil {
-				value = line
-				break
-			}
-		}
-	}
-	channel, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || channel < 1 || channel > 19 {
+	channel, err := modem.ParseCCHOChannel(response)
+	if err != nil {
 		return 0, errors.New("vocat: EC20 returned an invalid logical channel")
 	}
 	return channel, nil
@@ -1143,7 +1125,7 @@ func (adapter *EC20Adapter) selectBasicApplication(
 	// SELECT by DF name, request the first/only matching application and FCP.
 	apdu := []byte{0x00, 0xa4, 0x04, 0x04, byte(len(aidBytes))}
 	apdu = append(apdu, aidBytes...)
-	raw, err := adapter.transmitBasicAPDU(ctx, deviceID, apdu, false)
+	raw, err := adapter.transmitBasicAPDU(ctx, deviceID, apdu)
 	if err != nil {
 		return fmt.Errorf("select EC20 basic-channel application: %w", err)
 	}
@@ -1164,7 +1146,6 @@ func (adapter *EC20Adapter) transmitBasicAPDU(
 	ctx context.Context,
 	deviceID string,
 	apdu []byte,
-	sensitive bool,
 ) ([]byte, error) {
 	if len(apdu) == 0 || len(apdu) > 261 {
 		return nil, errors.New("vocat: invalid EC20 APDU length")
@@ -1195,10 +1176,6 @@ func (adapter *EC20Adapter) transmitBasicAPDU(
 		if err != nil {
 			return nil, errors.New("vocat: EC20 CSIM exchange failed")
 		}
-		raw, err := parseCSIMData(response)
-		if err != nil {
-			return nil, err
-		}
 		body, status, err := splitAPDUStatus(raw)
 		if err != nil {
 			return nil, err
@@ -1228,7 +1205,6 @@ func (adapter *EC20Adapter) transmitLogicalAPDU(
 	deviceID string,
 	channel int,
 	apdu []byte,
-	sensitive bool,
 ) ([]byte, error) {
 	if channel < 1 || channel > 19 || len(apdu) == 0 || len(apdu) > 261 {
 		return nil, ErrEC20AKACommand
@@ -1236,25 +1212,9 @@ func (adapter *EC20Adapter) transmitLogicalAPDU(
 	var collected []byte
 	current := append([]byte(nil), apdu...)
 	for exchange := 0; exchange < 4; exchange++ {
-		command := fmt.Sprintf(
-			`AT+CGLA=%d,%d,"%s"`,
-			channel,
-			len(current)*2,
-			strings.ToUpper(hex.EncodeToString(current)),
-		)
-		var response modem.Response
-		var err error
-		if sensitive {
-			response, err = adapter.executeSensitive(ctx, deviceID, command)
-		} else {
-			response, err = adapter.execute(ctx, deviceID, command)
-		}
+		raw, err := adapter.executor.ExecuteAPDU(ctx, deviceID, modem.APDUCGLA, channel, current)
 		if err != nil {
 			return nil, errors.Join(ErrEC20AKACommand, err)
-		}
-		raw, err := parseCGLAData(response)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrEC20AKAResponse, err)
 		}
 		body, status, err := splitAPDUStatus(raw)
 		if err != nil {
@@ -1290,17 +1250,6 @@ func (adapter *EC20Adapter) execute(
 	deviceID string,
 	command string,
 ) (modem.Response, error) {
-	return adapter.executor.ExecuteAT(ctx, deviceID, command)
-}
-
-func (adapter *EC20Adapter) executeSensitive(
-	ctx context.Context,
-	deviceID string,
-	command string,
-) (modem.Response, error) {
-	if executor, ok := adapter.executor.(EC20SensitiveATExecutor); ok {
-		return executor.ExecuteSensitiveAT(ctx, deviceID, command)
-	}
 	return adapter.executor.ExecuteAT(ctx, deviceID, command)
 }
 
@@ -1478,34 +1427,6 @@ func decodeBERTLVValue(data []byte) ([]byte, int, error) {
 	return data[lengthOctets : lengthOctets+length],
 		lengthOctets + length,
 		nil
-}
-
-func parseCGLAData(response modem.Response) ([]byte, error) {
-	return parseATAPDUData(response, "+CGLA:")
-}
-
-func parseCSIMData(response modem.Response) ([]byte, error) {
-	return parseATAPDUData(response, "+CSIM:")
-}
-
-func parseATAPDUData(response modem.Response, prefix string) ([]byte, error) {
-	fields := parseCSV(valueAfterATPrefix(response, prefix))
-	if len(fields) < 2 {
-		return nil, errors.New("EC20 response has no APDU")
-	}
-	declared, err := strconv.Atoi(fields[0])
-	if err != nil || declared < 0 {
-		return nil, errors.New("EC20 response has invalid APDU length")
-	}
-	encoded := strings.Trim(fields[1], `" `)
-	data, err := hex.DecodeString(encoded)
-	if err != nil {
-		return nil, errors.New("EC20 APDU response is not hexadecimal")
-	}
-	if declared != len(encoded) && declared != len(data) {
-		return nil, errors.New("EC20 APDU response length mismatch")
-	}
-	return data, nil
 }
 
 func responseContainsValue(
