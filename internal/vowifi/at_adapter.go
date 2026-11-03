@@ -460,38 +460,23 @@ func (adapter *atModemAdapter) CheckReady(
 		defer locker.UnlockUICC()
 	}
 
-	aid, application, err := adapter.discoverAKAApplication(ctx, binding.deviceID)
-	if err != nil {
-		return AKAEvidence{}, err
-	}
-	channel, err := adapter.openLogicalChannel(ctx, binding.deviceID, aid)
-	basicChannel := false
-	if err == nil {
-		if err := adapter.closeLogicalChannelWithCleanup(
-			binding.deviceID,
-			channel,
-		); err != nil {
-			return AKAEvidence{}, err
-		}
-	} else {
-		// Several EC20 firmware branches reject CCHO/CGLA even though their
-		// basic-channel CSIM implementation is standards compliant.
-		if err := adapter.selectBasicApplication(
-			ctx,
-			binding.deviceID,
-			aid,
-		); err != nil {
-			return AKAEvidence{}, errors.Join(
-				ErrATApplicationAbsent,
-				err,
-			)
-		}
-		basicChannel = true
+	// -----------------------------------------------------------------
+	// 【关键修复】：跳过 CUAD 探测和 CCHO 逻辑通道！
+	// 展锐 EC200T-CN 遇到 AT+CCHO 会直接 Crash 进 WUKONG 模式！
+	// -----------------------------------------------------------------
+	aid := usimAIDPrefix
+	application := "USIM"
+
+	// 尝试直接在 Basic Channel 选择 USIM 应用
+	if err := adapter.selectBasicApplication(ctx, binding.deviceID, aid); err != nil {
+		return AKAEvidence{}, errors.Join(ErrATApplicationAbsent, err)
 	}
 
+	// 强制标记为 basicChannel，以后所有 APDU 都走 AT+CSIM
 	binding.aid = aid
 	binding.application = application
-	binding.basicChannel = basicChannel
+	binding.basicChannel = true
+
 	adapter.mu.Lock()
 	adapter.bindings[binding.iccid] = binding
 	adapter.mu.Unlock()
@@ -525,6 +510,12 @@ func (adapter *atModemAdapter) authenticateWithApplication(
 	if err != nil {
 		return AKAResult{}, err
 	}
+
+	// -----------------------------------------------------------------
+	// 【关键修复】：防呆逻辑，强制 EC200T 走 Basic Channel (AT+CSIM)
+	// -----------------------------------------------------------------
+	binding.basicChannel = true
+
 	if strings.EqualFold(strings.TrimSpace(preference), "isim_strict") && binding.application != "ISIM" {
 		aid, application, err := adapter.discoverPreferredAKAApplication(
 			ctx,
@@ -837,6 +828,14 @@ func (adapter *atModemAdapter) EnterVoWiFiRFOff(
 	if mode != 4 {
 		if _, err := adapter.execute(ctx, deviceID, "AT+CFUN=4"); err != nil {
 			return fmt.Errorf("enter RF-off mode: %w", err)
+		}
+		// -------------------------------------------------------------
+		// 【修复项 3】：给硬件电源与基带 300ms 稳压和状态切换时间
+		// -------------------------------------------------------------
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(300 * time.Millisecond):
 		}
 	}
 	mode, err = adapter.readOperatingMode(ctx, deviceID)
@@ -1301,6 +1300,13 @@ func (adapter *atModemAdapter) transmitBasicAPDU(
 	var collected []byte
 	current := append([]byte(nil), apdu...)
 	for exchange := 0; exchange < 4; exchange++ {
+		// 每次发送前停顿 20ms，防止缓冲溢出
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+
 		raw, err := adapter.executor.ExecuteAPDU(ctx, deviceID, modem.APDUCSIM, 0, current)
 		if err != nil {
 			return nil, errors.New("vocat: CSIM exchange failed")
